@@ -123,11 +123,25 @@ def load_presets() -> list:
 
 
 def save_presets(presets: list) -> None:
+    save_presets_to(presets, SAVE_FILE)
+
+
+def save_presets_to(presets: list, path: Path) -> None:
+    """任意パスへ暗号化して保存"""
     plaintext = json.dumps(presets, ensure_ascii=False).encode("utf-8")
     key = _get_key()
-    nonce = os.urandom(12)  # 96ビットランダムnonce
+    nonce = os.urandom(12)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
-    SAVE_FILE.write_bytes(nonce + ciphertext)
+    path.write_bytes(nonce + ciphertext)
+
+
+def load_presets_from(path: Path) -> list:
+    """任意パスから暗号化ファイルを読み込む"""
+    raw = path.read_bytes()
+    nonce, ciphertext = raw[:12], raw[12:]
+    key = _get_key()
+    plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    return json.loads(plaintext.decode("utf-8"))
 
 
 # セキュリティ種別 → (authentication, encryption, keyType, useOneX, is_enterprise)
@@ -387,7 +401,7 @@ class WiFiPresetApp(tk.Tk):
         self._listbox.pack(fill="both", expand=True)
         self._listbox.bind("<<ListboxSelect>>", self._on_select)
 
-        # アクションボタン行
+        # アクションボタン行1
         btn_row = tk.Frame(right, bg=BG)
         btn_row.pack(fill="x", pady=(8, 0))
         btns = [
@@ -398,6 +412,21 @@ class WiFiPresetApp(tk.Tk):
         ]
         for txt, cmd, bg, fg in btns:
             b = tk.Button(btn_row, text=txt, command=cmd,
+                          bg=bg, fg=fg, relief="flat",
+                          font=("Segoe UI", 9, "bold"),
+                          cursor="hand2", padx=10, pady=6)
+            b.pack(side="left", padx=(0, 6))
+
+        # アクションボタン行2（バックアップ／復元）
+        btn_row2 = tk.Frame(right, bg=BG)
+        btn_row2.pack(fill="x", pady=(4, 0))
+        btns2 = [
+            ("📦 バックアップ", self._backup, "#1e3a2f", SUCCESS),
+            ("📂 復元", self._restore, "#1e3a2f", SUCCESS),
+            ("📋 全XMLを一括保存", self._export_all_xml, SURFACE, TEXT),
+        ]
+        for txt, cmd, bg, fg in btns2:
+            b = tk.Button(btn_row2, text=txt, command=cmd,
                           bg=bg, fg=fg, relief="flat",
                           font=("Segoe UI", 9, "bold"),
                           cursor="hand2", padx=10, pady=6)
@@ -603,6 +632,95 @@ class WiFiPresetApp(tk.Tk):
         if self._edit_index is not None:
             self._status.set("編集をキャンセルしました")
         self._end_edit()
+
+
+    # ── バックアップ／復元 ───────────────────────────────────
+    def _backup(self):
+        """全プロファイルを暗号化バックアップファイルとして書き出す"""
+        if not self.presets:
+            messagebox.showinfo("バックアップ", "登録済みのプロファイルがありません。")
+            return
+        from datetime import datetime
+        default_name = f"wifi_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.enc"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".enc",
+            initialfile=default_name,
+            filetypes=[("暗号化バックアップ", "*.enc"), ("すべて", "*.*")],
+            title="バックアップ先を選択"
+        )
+        if not path:
+            return
+        try:
+            save_presets_to(self.presets, Path(path))
+            self._status.set(f"📦 バックアップ完了: {Path(path).name}  ({len(self.presets)} 件)")
+            messagebox.showinfo("バックアップ完了",
+                f"{len(self.presets)} 件のプロファイルをバックアップしました。\n\n{path}")
+        except Exception as e:
+            messagebox.showerror("バックアップ失敗", str(e))
+
+    def _restore(self):
+        """バックアップファイルからプロファイルを復元する"""
+        path = filedialog.askopenfilename(
+            filetypes=[("暗号化バックアップ", "*.enc"), ("すべて", "*.*")],
+            title="復元するバックアップファイルを選択"
+        )
+        if not path:
+            return
+        try:
+            imported = load_presets_from(Path(path))
+        except Exception as e:
+            messagebox.showerror("復元失敗", f"ファイルの読み込みに失敗しました。\n\nこのPCで作成したバックアップファイルかご確認ください。\n\n{e}")
+            return
+        if not imported:
+            messagebox.showwarning("復元", "バックアップファイルにデータがありません。")
+            return
+
+        # 既存データとのマージ確認
+        if self.presets:
+            choice = messagebox.askyesnocancel(
+                "復元方法を選択",
+                "既に " + str(len(self.presets)) + " 件のプロファイルが登録されています。\n\n「はい」  → 既存データに追加（重複SSIDは上書き）\n「いいえ」→ 既存データを削除してバックアップで置き換え\n「キャンセル」→ 復元をやめる"
+            )
+            if choice is None:
+                return
+            if choice:
+                # マージ：重複SSIDは imported 側を優先
+                existing = {p["ssid"]: p for p in self.presets}
+                for p in imported:
+                    existing[p["ssid"]] = p
+                self.presets = list(existing.values())
+            else:
+                self.presets = imported
+        else:
+            self.presets = imported
+
+        save_presets(self.presets)
+        self._refresh_list()
+        self._status.set(f"📂 復元完了: {len(imported)} 件を読み込みました")
+        messagebox.showinfo("復元完了",
+            f"{len(imported)} 件のプロファイルを復元しました。")
+
+    def _export_all_xml(self):
+        """全プロファイルをXMLとしてフォルダに一括保存する"""
+        if not self.presets:
+            messagebox.showinfo("一括保存", "登録済みのプロファイルがありません。")
+            return
+        folder = filedialog.askdirectory(title="保存先フォルダを選択")
+        if not folder:
+            return
+        folder = Path(folder)
+        saved = []
+        for p in self.presets:
+            xml = generate_xml(p["ssid"], p["password"], p["auth"],
+                               "", p.get("auto_connect", True), p.get("hidden", False))
+            # ファイル名に使えない文字を置換
+            safe_ssid = re.sub(r'[\/:*?"<>|]', "_", p["ssid"])
+            fpath = folder / f"wifi_{safe_ssid}.xml"
+            fpath.write_text(xml, encoding="utf-8")
+            saved.append(fpath.name)
+        self._status.set(f"📋 {len(saved)} 件のXMLを保存しました → {folder}")
+        msg = "\n".join(saved)
+        messagebox.showinfo("一括保存完了", f"{len(saved)} 件のプロファイルをXMLとして保存しました。\n\n保存先: {folder}\n\n{msg}")
 
 
 # ────────────────────────────────────────────────────────────
