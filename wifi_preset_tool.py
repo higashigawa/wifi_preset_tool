@@ -126,21 +126,42 @@ def save_presets(presets: list) -> None:
     save_presets_to(presets, SAVE_FILE)
 
 
-def save_presets_to(presets: list, path: Path) -> None:
-    """任意パスへ暗号化して保存"""
+# バックアップファイルのマジックバイト（形式識別用）
+BACKUP_MAGIC = b"WIFIBAK1"  # 8バイト
+
+
+def _derive_key(password: str, salt: bytes) -> bytes:
+    """パスワードとsaltからPBKDF2-HMAC-SHA256でAES-256キーを導出する"""
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
+    return kdf.derive(password.encode("utf-8"))
+
+
+def save_presets_to(presets: list, path: Path, password: str = "") -> None:
+    """パスワードで暗号化してバックアップ保存する。
+    フォーマット: [8 magic][16 salt][12 nonce][ciphertext]
+    """
     plaintext = json.dumps(presets, ensure_ascii=False).encode("utf-8")
-    key = _get_key()
+    salt = os.urandom(16)
     nonce = os.urandom(12)
+    key = _derive_key(password, salt)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
-    path.write_bytes(nonce + ciphertext)
+    path.write_bytes(BACKUP_MAGIC + salt + nonce + ciphertext)
 
 
-def load_presets_from(path: Path) -> list:
-    """任意パスから暗号化ファイルを読み込む"""
+def load_presets_from(path: Path, password: str = "") -> list:
+    """パスワードで復号してバックアップを読み込む。"""
     raw = path.read_bytes()
-    nonce, ciphertext = raw[:12], raw[12:]
-    key = _get_key()
-    plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    if not raw.startswith(BACKUP_MAGIC):
+        raise ValueError("バックアップファイルの形式が正しくありません。")
+    raw = raw[len(BACKUP_MAGIC):]
+    salt, nonce, ciphertext = raw[:16], raw[16:28], raw[28:]
+    key = _derive_key(password, salt)
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+    except Exception:
+        raise ValueError("パスワードが違います。")
     return json.loads(plaintext.decode("utf-8"))
 
 
@@ -254,6 +275,149 @@ def import_to_windows(xml_content: str, ssid: str) -> tuple[bool, str]:
     except Exception as e:
         tmp.unlink(missing_ok=True)
         return False, str(e)
+
+
+# ────────────────────────────────────────────────────────────
+class ImportSelectDialog(tk.Toplevel):
+    """Windowsプロファイル選択ダイアログ"""
+    def __init__(self, parent, profile_names: list[str], existing_ssids: list[str]):
+        super().__init__(parent)
+        self.title("Windowsのプロファイルを選択")
+        self.configure(bg=SURFACE)
+        self.resizable(True, True)
+        self.grab_set()
+        self.selected: list[str] = []
+        self.geometry("440x420")
+
+        tk.Label(self, text="取り込むプロファイルを選択してください",
+                 bg=SURFACE, fg=TEXT, font=("Segoe UI", 10, "bold")
+                 ).pack(fill="x", padx=16, pady=(14, 4))
+        tk.Label(self, text="※ 既に登録済みのものには [登録済] が表示されます",
+                 bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)
+                 ).pack(fill="x", padx=16, pady=(0, 6))
+
+        # 全選択・解除ボタン
+        sel_row = tk.Frame(self, bg=SURFACE)
+        sel_row.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Button(sel_row, text="全選択", command=self._select_all,
+                  bg=CARD, fg=TEXT, relief="flat", font=("Segoe UI", 8),
+                  cursor="hand2", padx=8, pady=3).pack(side="left", padx=(0, 4))
+        tk.Button(sel_row, text="全解除", command=self._deselect_all,
+                  bg=CARD, fg=TEXT, relief="flat", font=("Segoe UI", 8),
+                  cursor="hand2", padx=8, pady=3).pack(side="left")
+
+        # チェックボックス一覧
+        frame = tk.Frame(self, bg=SURFACE)
+        frame.pack(fill="both", expand=True, padx=16)
+        canvas = tk.Canvas(frame, bg=SURFACE, highlightthickness=0)
+        sb = tk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=SURFACE)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        self._vars: list[tuple[tk.BooleanVar, str]] = []
+        for name in profile_names:
+            var = tk.BooleanVar(value=True)
+            tag = "  [登録済]" if name in existing_ssids else ""
+            fg_color = WARNING if tag else TEXT
+            cb = tk.Checkbutton(inner, text=f"{name}{tag}", variable=var,
+                                bg=SURFACE, fg=fg_color, selectcolor=CARD,
+                                activebackground=SURFACE, activeforeground=fg_color,
+                                font=("Segoe UI", 9), anchor="w")
+            cb.pack(fill="x", pady=1)
+            self._vars.append((var, name))
+
+        # ボタン
+        btn_row = tk.Frame(self, bg=SURFACE)
+        btn_row.pack(fill="x", padx=16, pady=12)
+        tk.Button(btn_row, text="取り込む", command=self._ok,
+                  bg=ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold"), cursor="hand2",
+                  padx=16, pady=6).pack(side="right")
+        tk.Button(btn_row, text="キャンセル", command=self.destroy,
+                  bg=CARD, fg=MUTED, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2",
+                  padx=12, pady=6).pack(side="right", padx=(0, 6))
+
+    def _select_all(self):
+        for var, _ in self._vars:
+            var.set(True)
+
+    def _deselect_all(self):
+        for var, _ in self._vars:
+            var.set(False)
+
+    def _ok(self):
+        self.selected = [name for var, name in self._vars if var.get()]
+        if not self.selected:
+            messagebox.showwarning("選択なし", "1つ以上選択してください。", parent=self)
+            return
+        self.destroy()
+
+
+# ────────────────────────────────────────────────────────────
+class PasswordDialog(tk.Toplevel):
+    """パスワード入力ダイアログ"""
+    def __init__(self, parent, title: str, prompt: str, confirm: bool = False):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=SURFACE)
+        self.resizable(False, False)
+        self.grab_set()
+        self.result = None
+        self.geometry("360x210" if confirm else "360x165")
+
+        tk.Label(self, text=prompt, bg=SURFACE, fg=TEXT,
+                 font=("Segoe UI", 10), wraplength=320, justify="left"
+                 ).pack(fill="x", padx=20, pady=(16, 4))
+
+        self._pw = tk.StringVar()
+        e1 = tk.Entry(self, textvariable=self._pw, show="*",
+                      bg=CARD, fg=TEXT, insertbackground=TEXT,
+                      relief="flat", font=("Segoe UI", 11),
+                      highlightbackground=BORDER, highlightthickness=1,
+                      highlightcolor=ACCENT)
+        e1.pack(fill="x", padx=20)
+        e1.focus_set()
+
+        self._pw2 = None
+        if confirm:
+            tk.Label(self, text="確認のため再入力", bg=SURFACE, fg=MUTED,
+                     font=("Segoe UI", 9)).pack(fill="x", padx=20, pady=(8, 2))
+            self._pw2 = tk.StringVar()
+            tk.Entry(self, textvariable=self._pw2, show="*",
+                     bg=CARD, fg=TEXT, insertbackground=TEXT,
+                     relief="flat", font=("Segoe UI", 11),
+                     highlightbackground=BORDER, highlightthickness=1,
+                     highlightcolor=ACCENT).pack(fill="x", padx=20)
+
+        btn_row = tk.Frame(self, bg=SURFACE)
+        btn_row.pack(fill="x", padx=20, pady=12)
+        tk.Button(btn_row, text="OK", command=self._ok,
+                  bg=ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold"), cursor="hand2",
+                  padx=16, pady=6).pack(side="right")
+        tk.Button(btn_row, text="キャンセル", command=self.destroy,
+                  bg=CARD, fg=MUTED, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2",
+                  padx=12, pady=6).pack(side="right", padx=(0, 6))
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _ok(self):
+        pw = self._pw.get()
+        if not pw:
+            messagebox.showwarning("入力エラー", "パスワードを入力してください。", parent=self)
+            return
+        if self._pw2 is not None and pw != self._pw2.get():
+            messagebox.showwarning("入力エラー", "パスワードが一致しません。", parent=self)
+            return
+        self.result = pw
+        self.destroy()
 
 
 # ────────────────────────────────────────────────────────────
@@ -424,6 +588,7 @@ class WiFiPresetApp(tk.Tk):
             ("📦 バックアップ", self._backup, "#1e3a2f", SUCCESS),
             ("📂 復元", self._restore, "#1e3a2f", SUCCESS),
             ("📋 全XMLを一括保存", self._export_all_xml, SURFACE, TEXT),
+            ("📥 Windowsから取り込む", self._import_from_windows, "#2d3250", TEXT),
         ]
         for txt, cmd, bg, fg in btns2:
             b = tk.Button(btn_row2, text=txt, command=cmd,
@@ -636,9 +801,15 @@ class WiFiPresetApp(tk.Tk):
 
     # ── バックアップ／復元 ───────────────────────────────────
     def _backup(self):
-        """全プロファイルを暗号化バックアップファイルとして書き出す"""
+        """全プロファイルをパスワード暗号化バックアップファイルとして書き出す"""
         if not self.presets:
             messagebox.showinfo("バックアップ", "登録済みのプロファイルがありません。")
+            return
+        dlg = PasswordDialog(self, "バックアップ用パスワード",
+                             "バックアップを保護するパスワードを設定してください。\n（復元時に必要になります）",
+                             confirm=True)
+        self.wait_window(dlg)
+        if dlg.result is None:
             return
         from datetime import datetime
         default_name = f"wifi_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.enc"
@@ -651,10 +822,10 @@ class WiFiPresetApp(tk.Tk):
         if not path:
             return
         try:
-            save_presets_to(self.presets, Path(path))
+            save_presets_to(self.presets, Path(path), dlg.result)
             self._status.set(f"📦 バックアップ完了: {Path(path).name}  ({len(self.presets)} 件)")
             messagebox.showinfo("バックアップ完了",
-                f"{len(self.presets)} 件のプロファイルをバックアップしました。\n\n{path}")
+                f"{len(self.presets)} 件のプロファイルをバックアップしました。\n\n{path}\n\n設定したパスワードを忘れずに保管してください。")
         except Exception as e:
             messagebox.showerror("バックアップ失敗", str(e))
 
@@ -666,10 +837,19 @@ class WiFiPresetApp(tk.Tk):
         )
         if not path:
             return
+        dlg = PasswordDialog(self, "バックアップのパスワード",
+                             "バックアップ作成時に設定したパスワードを入力してください。",
+                             confirm=False)
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
         try:
-            imported = load_presets_from(Path(path))
+            imported = load_presets_from(Path(path), dlg.result)
+        except ValueError as e:
+            messagebox.showerror("復元失敗", str(e))
+            return
         except Exception as e:
-            messagebox.showerror("復元失敗", f"ファイルの読み込みに失敗しました。\n\nこのPCで作成したバックアップファイルかご確認ください。\n\n{e}")
+            messagebox.showerror("復元失敗", f"ファイルの読み込みに失敗しました。\n\n{e}")
             return
         if not imported:
             messagebox.showwarning("復元", "バックアップファイルにデータがありません。")
@@ -721,6 +901,130 @@ class WiFiPresetApp(tk.Tk):
         self._status.set(f"📋 {len(saved)} 件のXMLを保存しました → {folder}")
         msg = "\n".join(saved)
         messagebox.showinfo("一括保存完了", f"{len(saved)} 件のプロファイルをXMLとして保存しました。\n\n保存先: {folder}\n\n{msg}")
+
+    def _import_from_windows(self):
+        """Windowsに登録済みのWi-Fiプロファイルを一括取り込む"""
+        # netsh で登録済みプロファイル名一覧を取得
+        try:
+            r = subprocess.run(
+                ["netsh", "wlan", "show", "profiles"],
+                capture_output=True
+            )
+            def _dec(b):
+                for enc in ("cp932", "utf-8", "utf-8-sig"):
+                    try: return b.decode(enc)
+                    except: pass
+                return b.decode("cp932", errors="replace")
+            output = _dec(r.stdout)
+        except Exception as e:
+            messagebox.showerror("取り込みエラー", f"netsh の実行に失敗しました。\n\n{e}")
+            return
+
+        # プロファイル名を抽出（"すべてのユーザー プロファイル : SSID名" の形式）
+        profile_names = []
+        for line in output.splitlines():
+            if ":" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    name = parts[1].strip()
+                    if name:
+                        profile_names.append(name)
+
+        if not profile_names:
+            messagebox.showinfo("取り込み", "Windowsに登録済みのWi-Fiプロファイルが見つかりませんでした。")
+            return
+
+        # 選択ダイアログを表示
+        dlg = ImportSelectDialog(self, profile_names, [p["ssid"] for p in self.presets])
+        self.wait_window(dlg)
+        if not dlg.selected:
+            return
+
+        # 選択されたプロファイルのXMLを取得して解析
+        imported = []
+        failed = []
+        for name in dlg.selected:
+            try:
+                r2 = subprocess.run(
+                    ["netsh", "wlan", "show", "profile", f"name={name}", "key=clear"],
+                    capture_output=True
+                )
+                xml_out = _dec(r2.stdout)
+                profile = self._parse_netsh_profile(xml_out, name)
+                if profile:
+                    imported.append(profile)
+                else:
+                    failed.append(name)
+            except Exception:
+                failed.append(name)
+
+        if not imported:
+            messagebox.showwarning("取り込み結果", "プロファイルの解析に失敗しました。")
+            return
+
+        # 既存データにマージ（重複SSIDは上書き確認）
+        existing_ssids = {p["ssid"] for p in self.presets}
+        duplicates = [p["ssid"] for p in imported if p["ssid"] in existing_ssids]
+        if duplicates:
+            dup_list = "\n".join(f"  ・{s}" for s in duplicates)
+            if not messagebox.askyesno("重複確認",
+                    f"以下のSSIDはすでに登録されています。上書きしますか？\n\n{dup_list}"):
+                imported = [p for p in imported if p["ssid"] not in existing_ssids]
+
+        for p in imported:
+            self.presets = [x for x in self.presets if x["ssid"] != p["ssid"]]
+            self.presets.append(p)
+
+        save_presets(self.presets)
+        self._refresh_list()
+
+        msg = f"{len(imported)} 件のプロファイルを取り込みました。"
+        if failed:
+            msg += f"\n\n取得できなかったプロファイル ({len(failed)} 件):\n" + "\n".join(f"  ・{n}" for n in failed)
+            msg += "\n\n（管理者として実行するとパスワードも取得できる場合があります）"
+        self._status.set(f"📥 {len(imported)} 件取り込み完了")
+        messagebox.showinfo("取り込み完了", msg)
+
+    def _parse_netsh_profile(self, output: str, ssid: str) -> dict | None:
+        """netsh show profile の出力からプロファイル情報を解析する"""
+        import re
+        # 認証方式
+        auth_match = re.search(r"認証\s*:\s*(.+)", output) or re.search(r"Authentication\s*:\s*(.+)", output)
+        # 暗号化
+        enc_match  = re.search(r"暗号化\s*:\s*(.+)", output) or re.search(r"Cipher\s*:\s*(.+)", output)
+        # パスワード（key=clear で取得可能な場合）
+        pw_match   = re.search(r"主要なコンテンツ\s*:\s*(.+)", output) or re.search(r"Key Content\s*:\s*(.+)", output)
+        # 自動接続
+        auto_match = re.search(r"接続モード\s*:\s*(.+)", output) or re.search(r"Connection mode\s*:\s*(.+)", output)
+        # 非ブロードキャスト
+        hidden_match = re.search(r"非ブロードキャスト\s*:\s*(.+)", output) or re.search(r"Non Broadcast\s*:\s*(.+)", output)
+
+        # 認証方式をツール内形式に変換
+        NETSH_AUTH_MAP = {
+            "WPA2-パーソナル": "WPA2-パーソナル", "WPA2 Personal": "WPA2-パーソナル",
+            "WPA2PSK": "WPA2-パーソナル",
+            "WPA3-パーソナル": "WPA3-パーソナル", "WPA3 Personal": "WPA3-パーソナル",
+            "WPA3SAE": "WPA3-パーソナル",
+            "WPA2-エンタープライズ": "WPA2-エンタープライズ", "WPA2 Enterprise": "WPA2-エンタープライズ",
+            "WPA3-エンタープライズ": "WPA3-エンタープライズ", "WPA3 Enterprise": "WPA3-エンタープライズ",
+            "オープン": "認証なし (オープン システム)", "Open": "認証なし (オープン システム)",
+        }
+        raw_auth = auth_match.group(1).strip() if auth_match else ""
+        auth = NETSH_AUTH_MAP.get(raw_auth, "WPA2-パーソナル")
+        password = pw_match.group(1).strip() if pw_match else ""
+        auto = True
+        if auto_match:
+            v = auto_match.group(1).strip()
+            auto = "自動" in v or "Auto" in v or "auto" in v
+        hidden = False
+        if hidden_match:
+            v = hidden_match.group(1).strip()
+            hidden = "はい" in v or "Yes" in v or "yes" in v
+
+        return {"ssid": ssid, "password": password, "auth": auth,
+                "auto_connect": auto, "hidden": hidden}
+
+
 
 
 # ────────────────────────────────────────────────────────────
