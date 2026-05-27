@@ -278,23 +278,27 @@ def import_to_windows(xml_content: str, ssid: str) -> tuple[bool, str]:
 
 
 # ────────────────────────────────────────────────────────────
-class ImportSelectDialog(tk.Toplevel):
-    """Windowsプロファイル選択ダイアログ"""
-    def __init__(self, parent, profile_names: list[str], existing_ssids: list[str]):
+class CheckSelectDialog(tk.Toplevel):
+    """汎用チェックボックス選択ダイアログ"""
+    def __init__(self, parent, title: str, prompt: str, ok_label: str,
+                 items: list[str], tags: dict[str, str] | None = None,
+                 default_checked: bool = True):
+        """
+        items      : 表示する項目名のリスト
+        tags       : {項目名: 付加タグ文字列} 色付きタグを付ける場合に指定
+        """
         super().__init__(parent)
-        self.title("Windowsのプロファイルを選択")
+        self.title(title)
         self.configure(bg=SURFACE)
         self.resizable(True, True)
         self.grab_set()
         self.selected: list[str] = []
         self.geometry("440x420")
+        tags = tags or {}
 
-        tk.Label(self, text="取り込むプロファイルを選択してください",
-                 bg=SURFACE, fg=TEXT, font=("Segoe UI", 10, "bold")
-                 ).pack(fill="x", padx=16, pady=(14, 4))
-        tk.Label(self, text="※ 既に登録済みのものには [登録済] が表示されます",
-                 bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)
-                 ).pack(fill="x", padx=16, pady=(0, 6))
+        tk.Label(self, text=prompt, bg=SURFACE, fg=TEXT,
+                 font=("Segoe UI", 10, "bold"), wraplength=400, justify="left"
+                 ).pack(fill="x", padx=16, pady=(14, 6))
 
         # 全選択・解除ボタン
         sel_row = tk.Frame(self, bg=SURFACE)
@@ -306,7 +310,7 @@ class ImportSelectDialog(tk.Toplevel):
                   bg=CARD, fg=TEXT, relief="flat", font=("Segoe UI", 8),
                   cursor="hand2", padx=8, pady=3).pack(side="left")
 
-        # チェックボックス一覧
+        # スクロール可能なチェックボックス一覧
         frame = tk.Frame(self, bg=SURFACE)
         frame.pack(fill="both", expand=True, padx=16)
         canvas = tk.Canvas(frame, bg=SURFACE, highlightthickness=0)
@@ -319,21 +323,22 @@ class ImportSelectDialog(tk.Toplevel):
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         self._vars: list[tuple[tk.BooleanVar, str]] = []
-        for name in profile_names:
-            var = tk.BooleanVar(value=True)
-            tag = "  [登録済]" if name in existing_ssids else ""
+        for name in items:
+            var = tk.BooleanVar(value=default_checked)
+            tag = tags.get(name, "")
             fg_color = WARNING if tag else TEXT
-            cb = tk.Checkbutton(inner, text=f"{name}{tag}", variable=var,
+            label = f"{name}  {tag}" if tag else name
+            cb = tk.Checkbutton(inner, text=label, variable=var,
                                 bg=SURFACE, fg=fg_color, selectcolor=CARD,
                                 activebackground=SURFACE, activeforeground=fg_color,
                                 font=("Segoe UI", 9), anchor="w")
             cb.pack(fill="x", pady=1)
             self._vars.append((var, name))
 
-        # ボタン
+        # ボタン行
         btn_row = tk.Frame(self, bg=SURFACE)
         btn_row.pack(fill="x", padx=16, pady=12)
-        tk.Button(btn_row, text="取り込む", command=self._ok,
+        tk.Button(btn_row, text=ok_label, command=self._ok,
                   bg=ACCENT, fg="white", relief="flat",
                   font=("Segoe UI", 10, "bold"), cursor="hand2",
                   padx=16, pady=6).pack(side="right")
@@ -356,6 +361,10 @@ class ImportSelectDialog(tk.Toplevel):
             messagebox.showwarning("選択なし", "1つ以上選択してください。", parent=self)
             return
         self.destroy()
+
+
+# 後方互換エイリアス（_import_from_windows が使用）
+ImportSelectDialog = CheckSelectDialog
 
 
 # ────────────────────────────────────────────────────────────
@@ -642,16 +651,25 @@ class WiFiPresetApp(tk.Tk):
                 f"  {auto_tag} {hidden_tag} [{auth_tag}]  {p['ssid']}")
         self._count_lbl.config(text=f"{len(self.presets)} 件")
 
+    def _selected_indices(self) -> list:
+        """選択中の全インデックスを返す"""
+        return list(self._listbox.curselection())
+
     def _selected_index(self):
+        """最初の選択インデックスを返す（1件操作用）"""
         sel = self._listbox.curselection()
         return sel[0] if sel else None
 
     def _on_select(self, _=None):
-        """リスト選択時にステータスバーへ選択中SSIDを表示する"""
-        idx = self._selected_index()
-        if idx is not None:
-            p = self.presets[idx]
+        """リスト選択時にステータスバーへ選択件数を表示する"""
+        sel = self._selected_indices()
+        if not sel:
+            return
+        if len(sel) == 1:
+            p = self.presets[sel[0]]
             self._status.set(f"選択中: {p['ssid']}  [{p['auth']}]  ─  編集するには「✏ 編集」を押してください")
+        else:
+            self._status.set(f"選択中: {len(sel)} 件  ─  「⚡ 一括適用」または「🗑 削除」で一括操作できます")
 
     # ── アクション ────────────────────────────────────────
     def _add_preset(self):
@@ -721,42 +739,69 @@ class WiFiPresetApp(tk.Tk):
                 f"  netsh wlan add profile filename=\"{path}\" user=all")
 
     def _apply_windows(self):
-        idx = self._selected_index()
-        if idx is None:
-            messagebox.showinfo("選択してください", "適用するプロファイルをリストから選択してください。")
+        if not self.presets:
+            messagebox.showinfo("適用", "登録済みのプロファイルがありません。")
             return
-        p = self.presets[idx]
+        items = [p["ssid"] for p in self.presets]
+        dlg = CheckSelectDialog(self,
+                                "Windowsへ一括適用",
+                                "Windowsに適用するプロファイルを選択してください",
+                                "⚡ 適用する",
+                                items=items, default_checked=False)
+        self.wait_window(dlg)
+        if not dlg.selected:
+            return
+        targets = [p for p in self.presets if p["ssid"] in set(dlg.selected)]
         if not messagebox.askyesno("確認",
-            f"「{p['ssid']}」をWindowsのWi-Fiプロファイルとして追加します。\n"
-            f"（管理者権限が必要な場合があります）\n\n続行しますか？"):
+                f"{len(targets)} 件をWindowsに適用します。\n（管理者権限が必要な場合があります）\n\n続行しますか？"):
             return
-        xml = generate_xml(p["ssid"], p["password"], p["auth"],
-                           "",  # encryption は AUTH_MAP から自動決定
-                           p.get("auto_connect", True),
-                           p.get("hidden", False))
-        ok, msg = import_to_windows(xml, p["ssid"])
-        if ok:
-            self._status.set(f"⚡ 「{p['ssid']}」をWindowsに適用しました")
-            messagebox.showinfo("適用完了",
-                f"「{p['ssid']}」のWi-Fiプロファイルを\nWindowsに追加しました。\n\n"
-                "Wi-Fiが圏内に入ると自動接続されます。")
+        ok_list, fail_list = [], []
+        for p in targets:
+            xml = generate_xml(p["ssid"], p["password"], p["auth"],
+                               "", p.get("auto_connect", True), p.get("hidden", False))
+            ok, msg = import_to_windows(xml, p["ssid"])
+            if ok:
+                ok_list.append(p["ssid"])
+            else:
+                fail_list.append((p["ssid"], msg))
+        parts = []
+        if ok_list:
+            parts.append("✅ 適用成功 ({}) 件:\n".format(len(ok_list)) + "\n".join(f"  ・{s}" for s in ok_list))
+        if fail_list:
+            parts.append("❌ 適用失敗 ({}) 件:\n".format(len(fail_list)) + "\n".join(f"  ・{s}: {m}" for s, m in fail_list))
+            parts.append("管理者として実行してみてください。")
+        result_msg = "\n\n".join(parts)
+        self._status.set(f"⚡ {len(ok_list)} 件適用完了" + (f"、{len(fail_list)} 件失敗" if fail_list else ""))
+        if fail_list:
+            messagebox.showwarning("適用結果", result_msg)
         else:
-            messagebox.showerror("適用失敗",
-                f"プロファイルの適用に失敗しました。\n\n{msg}\n\n"
-                "管理者として実行してみてください。")
+            messagebox.showinfo("適用完了", result_msg + "\n\nWi-Fiが圏内に入ると自動接続されます。")
+
 
     def _delete_preset(self):
-        idx = self._selected_index()
-        if idx is None:
-            messagebox.showinfo("選択してください", "削除するプロファイルをリストから選択してください。")
+        if not self.presets:
+            messagebox.showinfo("削除", "登録済みのプロファイルがありません。")
             return
-        p = self.presets[idx]
-        if messagebox.askyesno("削除確認", f"「{p['ssid']}」を削除しますか？"):
-            self.presets.pop(idx)
-            save_presets(self.presets)
-            self._refresh_list()
-            self._cancel_edit()
-            self._status.set(f"🗑 「{p['ssid']}」を削除しました")
+        items = [p["ssid"] for p in self.presets]
+        dlg = CheckSelectDialog(self,
+                                "プロファイルを削除",
+                                "削除するプロファイルを選択してください",
+                                "🗑 削除する",
+                                items=items, default_checked=False)
+        self.wait_window(dlg)
+        if not dlg.selected:
+            return
+        del_set = set(dlg.selected)
+        if not messagebox.askyesno("削除確認",
+                f"以下 {len(del_set)} 件を削除しますか？\n\n" +
+                "\n".join(f"  ・{s}" for s in dlg.selected)):
+            return
+        self.presets = [p for p in self.presets if p["ssid"] not in del_set]
+        save_presets(self.presets)
+        self._refresh_list()
+        self._cancel_edit()
+        self._status.set(f"🗑 {len(del_set)} 件を削除しました")
+
 
     def _start_edit(self):
         """選択中のプロファイルをフォームに読み込み編集モードへ"""
@@ -935,7 +980,13 @@ class WiFiPresetApp(tk.Tk):
             return
 
         # 選択ダイアログを表示
-        dlg = ImportSelectDialog(self, profile_names, [p["ssid"] for p in self.presets])
+        existing = {p["ssid"] for p in self.presets}
+        tags = {n: "[登録済]" for n in profile_names if n in existing}
+        dlg = CheckSelectDialog(self,
+                                "Windowsのプロファイルを選択",
+                                "取り込むプロファイルを選択してください",
+                                "取り込む",
+                                items=profile_names, tags=tags)
         self.wait_window(dlg)
         if not dlg.selected:
             return
