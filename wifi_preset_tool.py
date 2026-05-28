@@ -85,7 +85,15 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ─── データ保存ファイル ──────────────────────────────────────
-SAVE_FILE = Path(__file__).parent / "wifi_presets.enc"
+def _app_dir() -> Path:
+    """EXE化(PyInstaller)でも通常実行でも実行ファイルと同じフォルダを返す"""
+    if getattr(sys, "frozen", False):
+        # PyInstaller でEXE化された場合
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).parent
+
+SAVE_FILE = _app_dir() / "wifi_presets.enc"
 
 # ─── カラーパレット ──────────────────────────────────────────
 BG       = "#0f1117"
@@ -101,6 +109,18 @@ DANGER   = "#f87171"
 BORDER   = "#2d3250"
 
 
+# バックアップファイルのマジックバイト（形式識別用）
+BACKUP_MAGIC = b"WIFIBAK1"  # 8バイト
+
+
+def _derive_key(password: str, salt: bytes) -> bytes:
+    """パスワードとsaltからPBKDF2-HMAC-SHA256でAES-256キーを導出する"""
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
+    return kdf.derive(password.encode("utf-8"))
+
+
 def _get_key() -> bytes:
     """マシン固有情報からAES-256キーを導出する（ユーザーごとに異なる）"""
     import platform, getpass
@@ -113,9 +133,15 @@ def load_presets() -> list:
         return []
     try:
         raw = SAVE_FILE.read_bytes()
-        # フォーマット: [12バイト nonce][暗号文]
-        nonce, ciphertext = raw[:12], raw[12:]
-        key = _get_key()
+        # 新フォーマット: [8 magic][16 salt][12 nonce][ciphertext]
+        if raw.startswith(BACKUP_MAGIC):
+            raw2 = raw[len(BACKUP_MAGIC):]
+            salt, nonce, ciphertext = raw2[:16], raw2[16:28], raw2[28:]
+            key = _derive_key("", salt)  # パスワードなし（空文字）
+        else:
+            # 旧フォーマット互換: [12 nonce][ciphertext]
+            nonce, ciphertext = raw[:12], raw[12:]
+            key = _get_key()
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
         return json.loads(plaintext.decode("utf-8"))
     except Exception:
@@ -123,19 +149,8 @@ def load_presets() -> list:
 
 
 def save_presets(presets: list) -> None:
-    save_presets_to(presets, SAVE_FILE)
-
-
-# バックアップファイルのマジックバイト（形式識別用）
-BACKUP_MAGIC = b"WIFIBAK1"  # 8バイト
-
-
-def _derive_key(password: str, salt: bytes) -> bytes:
-    """パスワードとsaltからPBKDF2-HMAC-SHA256でAES-256キーを導出する"""
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
-    return kdf.derive(password.encode("utf-8"))
+    # 常に新フォーマットで保存（パスワードなし = 空文字）
+    save_presets_to(presets, SAVE_FILE, password="")
 
 
 def save_presets_to(presets: list, path: Path, password: str = "") -> None:
@@ -1008,7 +1023,6 @@ class WiFiPresetApp(tk.Tk):
                     failed.append(name)
             except Exception:
                 failed.append(name)
-
         if not imported:
             messagebox.showwarning("取り込み結果", "プロファイルの解析に失敗しました。")
             return
@@ -1037,26 +1051,67 @@ class WiFiPresetApp(tk.Tk):
         messagebox.showinfo("取り込み完了", msg)
 
     def _parse_netsh_profile(self, output: str, ssid: str) -> dict | None:
-        """netsh show profile の出力からプロファイル情報を解析する"""
+        """netsh show profile key=clear の出力からプロファイル情報を解析する。
+        テキスト出力とXML出力の両方に対応する。
+        """
         import re
-        # 認証方式
-        auth_match = re.search(r"認証\s*:\s*(.+)", output) or re.search(r"Authentication\s*:\s*(.+)", output)
-        # 暗号化
-        enc_match  = re.search(r"暗号化\s*:\s*(.+)", output) or re.search(r"Cipher\s*:\s*(.+)", output)
-        # パスワード（key=clear で取得可能な場合）
-        pw_match   = re.search(r"主要なコンテンツ\s*:\s*(.+)", output) or re.search(r"Key Content\s*:\s*(.+)", output)
-        # 自動接続
-        auto_match = re.search(r"接続モード\s*:\s*(.+)", output) or re.search(r"Connection mode\s*:\s*(.+)", output)
-        # 非ブロードキャスト
-        hidden_match = re.search(r"非ブロードキャスト\s*:\s*(.+)", output) or re.search(r"Non Broadcast\s*:\s*(.+)", output)
+        import xml.etree.ElementTree as _ET
 
-        # 認証方式をツール内形式に変換
+        # ── XMLとして解析（最も正確）──
+        # netsh の出力にはXMLブロックが埋め込まれている場合がある
+        # まず <?xml ... から </WLANProfile> を抜き出して試みる
+        xml_match = re.search(r'(<\?xml.*?</WLANProfile>)', output, re.DOTALL)
+        if xml_match:
+            try:
+                ns = "http://www.microsoft.com/networking/WLAN/profile/v1"
+                root = _ET.fromstring(xml_match.group(1))
+
+                def _find(tag):
+                    return root.find(f".//{{{ns}}}{tag}")
+
+                # 隠しSSID: <nonBroadcast>true</nonBroadcast>
+                nb = _find("nonBroadcast")
+                hidden = nb is not None and nb.text.strip().lower() == "true"
+
+                # 接続モード: <connectionMode>auto</connectionMode>
+                cm = _find("connectionMode")
+                auto = cm is None or cm.text.strip().lower() == "auto"
+
+                # 認証
+                auth_el = _find("authentication")
+                raw_auth = auth_el.text.strip() if auth_el is not None else ""
+
+                # パスワード
+                km = _find("keyMaterial")
+                password = km.text.strip() if km is not None else ""
+
+                NETSH_AUTH_MAP = {
+                    "WPA2PSK":  "WPA2-パーソナル",
+                    "WPA3SAE":  "WPA3-パーソナル",
+                    "WPA2ENT":  "WPA2-エンタープライズ",
+                    "WPA3ENT":  "WPA3-エンタープライズ",
+                    "WPA3ENT192": "WPA3-エンタープライズ 192 ビット",
+                    "open":     "認証なし (オープン システム)",
+                }
+                auth = NETSH_AUTH_MAP.get(raw_auth, "WPA2-パーソナル")
+                return {"ssid": ssid, "password": password, "auth": auth,
+                        "auto_connect": auto, "hidden": hidden}
+            except Exception:
+                pass  # XML解析失敗時はテキスト解析にフォールバック
+
+        # ── テキスト解析（フォールバック）──
+        auth_match = re.search(r"認証\s*:\s*(.+)", output) or re.search(r"Authentication\s*:\s*(.+)", output)
+        pw_match   = re.search(r"主要なコンテンツ\s*:\s*(.+)", output) or re.search(r"Key Content\s*:\s*(.+)", output)
+        auto_match = re.search(r"接続モード\s*:\s*(.+)", output) or re.search(r"Connection mode\s*:\s*(.+)", output)
+        # 「ネットワーク ブロードキャスト」ブロックを複数行含めて取得
+        # 隠しSSID → "ブロードキャスト配信していなくても接続"（改行をまたぐ場合あり）
+        # 通常SSID → "ブロードキャスト配信している場合に限り接続"
+        broadcast_match = re.search("\u30cd\u30c3\u30c8\u30ef\u30fc\u30af \u30d6\u30ed\u30fc\u30c9\u30ad\u30e3\u30b9\u30c8[^\n]*:([^\n]+(?:\n[ \t]+[^\n]+)*)", output)
+
         NETSH_AUTH_MAP = {
-            "WPA2-パーソナル": "WPA2-パーソナル", "WPA2 Personal": "WPA2-パーソナル",
-            "WPA2PSK": "WPA2-パーソナル",
-            "WPA3-パーソナル": "WPA3-パーソナル", "WPA3 Personal": "WPA3-パーソナル",
-            "WPA3SAE": "WPA3-パーソナル",
-            "WPA2-エンタープライズ": "WPA2-エンタープライズ", "WPA2 Enterprise": "WPA2-エンタープライズ",
+            "WPA2-パーソナル": "WPA2-パーソナル", "WPA2 Personal": "WPA2-パーソナル", "WPA2PSK": "WPA2-パーソナル",
+            "WPA3-パーソナル": "WPA3-パーソナル", "WPA3 Personal": "WPA3-パーソナル", "WPA3SAE": "WPA3-パーソナル",
+            "WPA2-エンタープライズ": "WPA2-エンタープライズ", "WPA2 Enterprise": "WPA2-エンタープライズ", "WPA2ENT": "WPA2-エンタープライズ",
             "WPA3-エンタープライズ": "WPA3-エンタープライズ", "WPA3 Enterprise": "WPA3-エンタープライズ",
             "オープン": "認証なし (オープン システム)", "Open": "認証なし (オープン システム)",
         }
@@ -1066,11 +1121,12 @@ class WiFiPresetApp(tk.Tk):
         auto = True
         if auto_match:
             v = auto_match.group(1).strip()
-            auto = "自動" in v or "Auto" in v or "auto" in v
+            auto = "自動" in v or "Auto" in v or "auto" in v.lower()
         hidden = False
-        if hidden_match:
-            v = hidden_match.group(1).strip()
-            hidden = "はい" in v or "Yes" in v or "yes" in v
+        if broadcast_match:
+            # 複数行をスペースで結合して判定
+            v = " ".join(broadcast_match.group(1).split())
+            hidden = "いなくても" in v or "non" in v.lower() or "true" in v.lower()
 
         return {"ssid": ssid, "password": password, "auth": auth,
                 "auto_connect": auto, "hidden": hidden}
@@ -1081,7 +1137,7 @@ class WiFiPresetApp(tk.Tk):
 # ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import traceback
-    _log = Path(__file__).parent / "wifi_preset_error.log"
+    _log = _app_dir() / "wifi_preset_error.log"
     try:
         # ttk スタイル調整
         app = WiFiPresetApp()
