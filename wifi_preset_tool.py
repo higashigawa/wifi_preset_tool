@@ -666,7 +666,6 @@ class WiFiPresetApp(tk.Tk):
                 f"  {auto_tag} {hidden_tag} [{auth_tag}]  {p['ssid']}")
         self._count_lbl.config(text=f"{len(self.presets)} 件")
 
-    def _selected_indices(self) -> list:
         """選択中の全インデックスを返す"""
         return list(self._listbox.curselection())
 
@@ -770,6 +769,7 @@ class WiFiPresetApp(tk.Tk):
         if not messagebox.askyesno("確認",
                 f"{len(targets)} 件をWindowsに適用します。\n（管理者権限が必要な場合があります）\n\n続行しますか？"):
             return
+
         ok_list, fail_list = [], []
         for p in targets:
             xml = generate_xml(p["ssid"], p["password"], p["auth"],
@@ -1006,7 +1006,6 @@ class WiFiPresetApp(tk.Tk):
         if not dlg.selected:
             return
 
-        # 選択されたプロファイルのXMLを取得して解析
         imported = []
         failed = []
         for name in dlg.selected:
@@ -1027,7 +1026,6 @@ class WiFiPresetApp(tk.Tk):
             messagebox.showwarning("取り込み結果", "プロファイルの解析に失敗しました。")
             return
 
-        # 既存データにマージ（重複SSIDは上書き確認）
         existing_ssids = {p["ssid"] for p in self.presets}
         duplicates = [p["ssid"] for p in imported if p["ssid"] in existing_ssids]
         if duplicates:
@@ -1042,7 +1040,6 @@ class WiFiPresetApp(tk.Tk):
 
         save_presets(self.presets)
         self._refresh_list()
-
         msg = f"{len(imported)} 件のプロファイルを取り込みました。"
         if failed:
             msg += f"\n\n取得できなかったプロファイル ({len(failed)} 件):\n" + "\n".join(f"  ・{n}" for n in failed)
