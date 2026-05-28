@@ -261,6 +261,8 @@ def generate_xml(ssid: str, password: str, auth: str, encryption: str, auto_conn
     return xml
 
 
+# DoH モード選択肢
+
 def import_to_windows(xml_content: str, ssid: str) -> tuple[bool, str]:
     """netsh で Windows へ直接インポートする"""
     tmp = Path(os.environ.get("TEMP", ".")) / f"wifi_{ssid}_tmp.xml"
@@ -292,7 +294,6 @@ def import_to_windows(xml_content: str, ssid: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-# ────────────────────────────────────────────────────────────
 class CheckSelectDialog(tk.Toplevel):
     """汎用チェックボックス選択ダイアログ"""
     def __init__(self, parent, title: str, prompt: str, ok_label: str,
@@ -477,9 +478,46 @@ class WiFiPresetApp(tk.Tk):
         main.pack(fill="both", expand=True, padx=16, pady=12)
 
         # 左：登録フォーム
-        left = tk.Frame(main, bg=SURFACE, padx=20, pady=20,
-                        highlightbackground=BORDER, highlightthickness=1)
-        left.pack(side="left", fill="y", ipadx=4)
+        # 左ペイン: スクロール可能なフォーム
+        left_outer = tk.Frame(main, bg=SURFACE,
+                              highlightbackground=BORDER, highlightthickness=1)
+        left_outer.pack(side="left", fill="both", ipadx=0)
+
+        left_canvas = tk.Canvas(left_outer, bg=SURFACE, highlightthickness=0,
+                                width=260)
+        left_sb = tk.Scrollbar(left_outer, orient="vertical",
+                               command=left_canvas.yview, bg=SURFACE)
+        left_canvas.configure(yscrollcommand=left_sb.set)
+        left_sb.pack(side="right", fill="y")
+        left_canvas.pack(side="left", fill="both", expand=True)
+
+        left = tk.Frame(left_canvas, bg=SURFACE, padx=20, pady=20)
+        left_canvas_window = left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _on_left_configure(e):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+            left_canvas.itemconfig(left_canvas_window, width=left_canvas.winfo_width())
+        left.bind("<Configure>", _on_left_configure)
+        left_canvas.bind("<Configure>", lambda e: left_canvas.itemconfig(
+            left_canvas_window, width=e.width))
+
+        # マウスホイールスクロール（DNS設定展開中のみ有効）
+        def _on_mousewheel(e):
+            left_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        def _bind_mousewheel_recursive(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            for child in widget.winfo_children():
+                _bind_mousewheel_recursive(child)
+
+        def _unbind_mousewheel_recursive(widget):
+            widget.unbind("<MouseWheel>")
+            for child in widget.winfo_children():
+                _unbind_mousewheel_recursive(child)
+
+        self._bind_mousewheel   = _bind_mousewheel_recursive
+        self._unbind_mousewheel = _unbind_mousewheel_recursive
+        self._left_canvas = left_canvas
 
         self._form_title = tk.Label(left, text="新規プロファイル登録", font=("Segoe UI", 11, "bold"),
                  bg=SURFACE, fg=TEXT)
@@ -546,7 +584,7 @@ class WiFiPresetApp(tk.Tk):
                             bg=ACCENT, fg="white", relief="flat",
                             font=("Segoe UI", 10, "bold"),
                             cursor="hand2", pady=8)
-        self._add_btn.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        self._add_btn.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         self._hover(self._add_btn, ACCENT, "#3a7ae0")
 
         # キャンセルボタン（編集中のみ表示）
@@ -556,7 +594,7 @@ class WiFiPresetApp(tk.Tk):
                             font=("Segoe UI", 9),
                             cursor="hand2", pady=4,
                             highlightbackground=BORDER, highlightthickness=1)
-        self._cancel_btn.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._cancel_btn.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._cancel_btn.grid_remove()  # 初期非表示
 
         # 編集中インデックス（None = 新規登録モード）
@@ -666,6 +704,7 @@ class WiFiPresetApp(tk.Tk):
                 f"  {auto_tag} {hidden_tag} [{auth_tag}]  {p['ssid']}")
         self._count_lbl.config(text=f"{len(self.presets)} 件")
 
+    def _selected_indices(self) -> list:
         """選択中の全インデックスを返す"""
         return list(self._listbox.curselection())
 
@@ -704,7 +743,7 @@ class WiFiPresetApp(tk.Tk):
             self.presets[self._edit_index] = {
                 "ssid": ssid, "password": pw,
                 "auth": auth, "auto_connect": auto,
-                "hidden": self._hidden_var.get()
+                "hidden": self._hidden_var.get(),
             }
             save_presets(self.presets)
             self._refresh_list()
@@ -721,7 +760,7 @@ class WiFiPresetApp(tk.Tk):
             self.presets.append({
                 "ssid": ssid, "password": pw,
                 "auth": auth, "auto_connect": auto,
-                "hidden": self._hidden_var.get()
+                "hidden": self._hidden_var.get(),
             })
             save_presets(self.presets)
             self._refresh_list()
@@ -786,11 +825,7 @@ class WiFiPresetApp(tk.Tk):
             parts.append("❌ 適用失敗 ({}) 件:\n".format(len(fail_list)) + "\n".join(f"  ・{s}: {m}" for s, m in fail_list))
             parts.append("管理者として実行してみてください。")
         result_msg = "\n\n".join(parts)
-        self._status.set(f"⚡ {len(ok_list)} 件適用完了" + (f"、{len(fail_list)} 件失敗" if fail_list else ""))
-        if fail_list:
-            messagebox.showwarning("適用結果", result_msg)
-        else:
-            messagebox.showinfo("適用完了", result_msg + "\n\nWi-Fiが圏内に入ると自動接続されます。")
+        messagebox.showinfo("適用完了", result_msg + "\n\nWi-Fiが圏内に入ると自動接続されます。")
 
 
     def _delete_preset(self):
@@ -816,6 +851,8 @@ class WiFiPresetApp(tk.Tk):
         self._refresh_list()
         self._cancel_edit()
         self._status.set(f"🗑 {len(del_set)} 件を削除しました")
+
+
 
 
     def _start_edit(self):
@@ -858,10 +895,8 @@ class WiFiPresetApp(tk.Tk):
             self._status.set("編集をキャンセルしました")
         self._end_edit()
 
-
     # ── バックアップ／復元 ───────────────────────────────────
     def _backup(self):
-        """全プロファイルをパスワード暗号化バックアップファイルとして書き出す"""
         if not self.presets:
             messagebox.showinfo("バックアップ", "登録済みのプロファイルがありません。")
             return
@@ -874,27 +909,23 @@ class WiFiPresetApp(tk.Tk):
         from datetime import datetime
         default_name = f"wifi_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.enc"
         path = filedialog.asksaveasfilename(
-            defaultextension=".enc",
-            initialfile=default_name,
+            defaultextension=".enc", initialfile=default_name,
             filetypes=[("暗号化バックアップ", "*.enc"), ("すべて", "*.*")],
-            title="バックアップ先を選択"
-        )
+            title="バックアップ先を選択")
         if not path:
             return
         try:
             save_presets_to(self.presets, Path(path), dlg.result)
-            self._status.set(f"📦 バックアップ完了: {Path(path).name}  ({len(self.presets)} 件)")
+            self._status.set(f"📦 バックアップ完了: {Path(path).name} ({len(self.presets)} 件)")
             messagebox.showinfo("バックアップ完了",
                 f"{len(self.presets)} 件のプロファイルをバックアップしました。\n\n{path}\n\n設定したパスワードを忘れずに保管してください。")
         except Exception as e:
             messagebox.showerror("バックアップ失敗", str(e))
 
     def _restore(self):
-        """バックアップファイルからプロファイルを復元する"""
         path = filedialog.askopenfilename(
             filetypes=[("暗号化バックアップ", "*.enc"), ("すべて", "*.*")],
-            title="復元するバックアップファイルを選択"
-        )
+            title="復元するバックアップファイルを選択")
         if not path:
             return
         dlg = PasswordDialog(self, "バックアップのパスワード",
@@ -914,17 +945,15 @@ class WiFiPresetApp(tk.Tk):
         if not imported:
             messagebox.showwarning("復元", "バックアップファイルにデータがありません。")
             return
-
-        # 既存データとのマージ確認
         if self.presets:
-            choice = messagebox.askyesnocancel(
-                "復元方法を選択",
-                "既に " + str(len(self.presets)) + " 件のプロファイルが登録されています。\n\n「はい」  → 既存データに追加（重複SSIDは上書き）\n「いいえ」→ 既存データを削除してバックアップで置き換え\n「キャンセル」→ 復元をやめる"
-            )
+            choice = messagebox.askyesnocancel("復元方法を選択",
+                f"既に {len(self.presets)} 件のプロファイルが登録されています。\n\n"
+                "「はい」  → 既存データに追加（重複SSIDは上書き）\n"
+                "「いいえ」→ 既存データを削除してバックアップで置き換え\n"
+                "「キャンセル」→ 復元をやめる")
             if choice is None:
                 return
             if choice:
-                # マージ：重複SSIDは imported 側を優先
                 existing = {p["ssid"]: p for p in self.presets}
                 for p in imported:
                     existing[p["ssid"]] = p
@@ -933,15 +962,12 @@ class WiFiPresetApp(tk.Tk):
                 self.presets = imported
         else:
             self.presets = imported
-
         save_presets(self.presets)
         self._refresh_list()
         self._status.set(f"📂 復元完了: {len(imported)} 件を読み込みました")
-        messagebox.showinfo("復元完了",
-            f"{len(imported)} 件のプロファイルを復元しました。")
+        messagebox.showinfo("復元完了", f"{len(imported)} 件のプロファイルを復元しました。")
 
     def _export_all_xml(self):
-        """全プロファイルをXMLとしてフォルダに一括保存する"""
         if not self.presets:
             messagebox.showinfo("一括保存", "登録済みのプロファイルがありません。")
             return
@@ -953,34 +979,29 @@ class WiFiPresetApp(tk.Tk):
         for p in self.presets:
             xml = generate_xml(p["ssid"], p["password"], p["auth"],
                                "", p.get("auto_connect", True), p.get("hidden", False))
-            # ファイル名に使えない文字を置換
-            safe_ssid = re.sub(r'[\/:*?"<>|]', "_", p["ssid"])
+            safe_ssid = re.sub(r'[\\/:*?"<>|]', "_", p["ssid"])
             fpath = folder / f"wifi_{safe_ssid}.xml"
             fpath.write_text(xml, encoding="utf-8")
             saved.append(fpath.name)
-        self._status.set(f"📋 {len(saved)} 件のXMLを保存しました → {folder}")
         msg = "\n".join(saved)
-        messagebox.showinfo("一括保存完了", f"{len(saved)} 件のプロファイルをXMLとして保存しました。\n\n保存先: {folder}\n\n{msg}")
+        self._status.set(f"📋 {len(saved)} 件のXMLを保存しました → {folder}")
+        messagebox.showinfo("一括保存完了",
+            f"{len(saved)} 件のプロファイルをXMLとして保存しました。\n\n保存先: {folder}\n\n{msg}")
 
     def _import_from_windows(self):
-        """Windowsに登録済みのWi-Fiプロファイルを一括取り込む"""
-        # netsh で登録済みプロファイル名一覧を取得
+        def _dec(b):
+            for enc in ("cp932", "utf-8", "utf-8-sig"):
+                try: return b.decode(enc)
+                except: pass
+            return b.decode("cp932", errors="replace")
+
         try:
-            r = subprocess.run(
-                ["netsh", "wlan", "show", "profiles"],
-                capture_output=True
-            )
-            def _dec(b):
-                for enc in ("cp932", "utf-8", "utf-8-sig"):
-                    try: return b.decode(enc)
-                    except: pass
-                return b.decode("cp932", errors="replace")
+            r = subprocess.run(["netsh", "wlan", "show", "profiles"], capture_output=True)
             output = _dec(r.stdout)
         except Exception as e:
             messagebox.showerror("取り込みエラー", f"netsh の実行に失敗しました。\n\n{e}")
             return
 
-        # プロファイル名を抽出（"すべてのユーザー プロファイル : SSID名" の形式）
         profile_names = []
         for line in output.splitlines():
             if ":" in line:
@@ -994,26 +1015,21 @@ class WiFiPresetApp(tk.Tk):
             messagebox.showinfo("取り込み", "Windowsに登録済みのWi-Fiプロファイルが見つかりませんでした。")
             return
 
-        # 選択ダイアログを表示
         existing = {p["ssid"] for p in self.presets}
         tags = {n: "[登録済]" for n in profile_names if n in existing}
-        dlg = CheckSelectDialog(self,
-                                "Windowsのプロファイルを選択",
-                                "取り込むプロファイルを選択してください",
-                                "取り込む",
+        dlg = CheckSelectDialog(self, "Windowsのプロファイルを選択",
+                                "取り込むプロファイルを選択してください", "取り込む",
                                 items=profile_names, tags=tags)
         self.wait_window(dlg)
         if not dlg.selected:
             return
 
-        imported = []
-        failed = []
+        imported, failed = [], []
         for name in dlg.selected:
             try:
                 r2 = subprocess.run(
                     ["netsh", "wlan", "show", "profile", f"name={name}", "key=clear"],
-                    capture_output=True
-                )
+                    capture_output=True)
                 xml_out = _dec(r2.stdout)
                 profile = self._parse_netsh_profile(xml_out, name)
                 if profile:
@@ -1022,6 +1038,7 @@ class WiFiPresetApp(tk.Tk):
                     failed.append(name)
             except Exception:
                 failed.append(name)
+
         if not imported:
             messagebox.showwarning("取り込み結果", "プロファイルの解析に失敗しました。")
             return
@@ -1035,6 +1052,13 @@ class WiFiPresetApp(tk.Tk):
                 imported = [p for p in imported if p["ssid"] not in existing_ssids]
 
         for p in imported:
+            # DNS設定が空欄かつ既存プロファイルに設定があれば引き継ぐ
+            if not p.get("dns_primary"):
+                ex = next((x for x in self.presets if x["ssid"] == p["ssid"]), None)
+                if ex and ex.get("dns_primary"):
+                    for k in ("dns_primary","dns_secondary","dns_interface",
+                              "doh_mode","doh_tmpl_primary","doh_tmpl_secondary"):
+                        p[k] = ex.get(k, "")
             self.presets = [x for x in self.presets if x["ssid"] != p["ssid"]]
             self.presets.append(p)
 
@@ -1048,87 +1072,59 @@ class WiFiPresetApp(tk.Tk):
         messagebox.showinfo("取り込み完了", msg)
 
     def _parse_netsh_profile(self, output: str, ssid: str) -> dict | None:
-        """netsh show profile key=clear の出力からプロファイル情報を解析する。
-        テキスト出力とXML出力の両方に対応する。
-        """
-        import re
+        import re as _re
         import xml.etree.ElementTree as _ET
-
-        # ── XMLとして解析（最も正確）──
-        # netsh の出力にはXMLブロックが埋め込まれている場合がある
-        # まず <?xml ... から </WLANProfile> を抜き出して試みる
-        xml_match = re.search(r'(<\?xml.*?</WLANProfile>)', output, re.DOTALL)
+        xml_match = _re.search(r'(<\?xml.*?</WLANProfile>)', output, _re.DOTALL)
         if xml_match:
             try:
                 ns = "http://www.microsoft.com/networking/WLAN/profile/v1"
                 root = _ET.fromstring(xml_match.group(1))
-
                 def _find(tag):
                     return root.find(f".//{{{ns}}}{tag}")
-
-                # 隠しSSID: <nonBroadcast>true</nonBroadcast>
                 nb = _find("nonBroadcast")
                 hidden = nb is not None and nb.text.strip().lower() == "true"
-
-                # 接続モード: <connectionMode>auto</connectionMode>
                 cm = _find("connectionMode")
                 auto = cm is None or cm.text.strip().lower() == "auto"
-
-                # 認証
                 auth_el = _find("authentication")
                 raw_auth = auth_el.text.strip() if auth_el is not None else ""
-
-                # パスワード
                 km = _find("keyMaterial")
                 password = km.text.strip() if km is not None else ""
-
                 NETSH_AUTH_MAP = {
-                    "WPA2PSK":  "WPA2-パーソナル",
-                    "WPA3SAE":  "WPA3-パーソナル",
-                    "WPA2ENT":  "WPA2-エンタープライズ",
-                    "WPA3ENT":  "WPA3-エンタープライズ",
+                    "WPA2PSK": "WPA2-パーソナル", "WPA3SAE": "WPA3-パーソナル",
+                    "WPA2ENT": "WPA2-エンタープライズ", "WPA3ENT": "WPA3-エンタープライズ",
                     "WPA3ENT192": "WPA3-エンタープライズ 192 ビット",
-                    "open":     "認証なし (オープン システム)",
+                    "open": "認証なし (オープン システム)",
                 }
                 auth = NETSH_AUTH_MAP.get(raw_auth, "WPA2-パーソナル")
                 return {"ssid": ssid, "password": password, "auth": auth,
                         "auto_connect": auto, "hidden": hidden}
             except Exception:
-                pass  # XML解析失敗時はテキスト解析にフォールバック
-
-        # ── テキスト解析（フォールバック）──
-        auth_match = re.search(r"認証\s*:\s*(.+)", output) or re.search(r"Authentication\s*:\s*(.+)", output)
-        pw_match   = re.search(r"主要なコンテンツ\s*:\s*(.+)", output) or re.search(r"Key Content\s*:\s*(.+)", output)
-        auto_match = re.search(r"接続モード\s*:\s*(.+)", output) or re.search(r"Connection mode\s*:\s*(.+)", output)
-        # 「ネットワーク ブロードキャスト」ブロックを複数行含めて取得
-        # 隠しSSID → "ブロードキャスト配信していなくても接続"（改行をまたぐ場合あり）
-        # 通常SSID → "ブロードキャスト配信している場合に限り接続"
-        broadcast_match = re.search("\u30cd\u30c3\u30c8\u30ef\u30fc\u30af \u30d6\u30ed\u30fc\u30c9\u30ad\u30e3\u30b9\u30c8[^\n]*:([^\n]+(?:\n[ \t]+[^\n]+)*)", output)
+                pass
 
         NETSH_AUTH_MAP = {
             "WPA2-パーソナル": "WPA2-パーソナル", "WPA2 Personal": "WPA2-パーソナル", "WPA2PSK": "WPA2-パーソナル",
             "WPA3-パーソナル": "WPA3-パーソナル", "WPA3 Personal": "WPA3-パーソナル", "WPA3SAE": "WPA3-パーソナル",
-            "WPA2-エンタープライズ": "WPA2-エンタープライズ", "WPA2 Enterprise": "WPA2-エンタープライズ", "WPA2ENT": "WPA2-エンタープライズ",
+            "WPA2-エンタープライズ": "WPA2-エンタープライズ", "WPA2 Enterprise": "WPA2-エンタープライズ",
             "WPA3-エンタープライズ": "WPA3-エンタープライズ", "WPA3 Enterprise": "WPA3-エンタープライズ",
             "オープン": "認証なし (オープン システム)", "Open": "認証なし (オープン システム)",
         }
+        auth_match = _re.search(r"認証\s*:\s*(.+)", output) or _re.search(r"Authentication\s*:\s*(.+)", output)
+        pw_match = _re.search(r"主要なコンテンツ\s*:\s*(.+)", output) or _re.search(r"Key Content\s*:\s*(.+)", output)
+        auto_match = _re.search(r"接続モード\s*:\s*(.+)", output) or _re.search(r"Connection mode\s*:\s*(.+)", output)
+        broadcast_match = _re.search("\u30cd\u30c3\u30c8\u30ef\u30fc\u30af \u30d6\u30ed\u30fc\u30c9\u30ad\u30e3\u30b9\u30c8[^\n]*:([^\n]+(?:\n[ \t]+[^\n]+)*)", output)
         raw_auth = auth_match.group(1).strip() if auth_match else ""
         auth = NETSH_AUTH_MAP.get(raw_auth, "WPA2-パーソナル")
         password = pw_match.group(1).strip() if pw_match else ""
         auto = True
         if auto_match:
             v = auto_match.group(1).strip()
-            auto = "自動" in v or "Auto" in v or "auto" in v.lower()
+            auto = "自動" in v or "auto" in v.lower()
         hidden = False
         if broadcast_match:
-            # 複数行をスペースで結合して判定
             v = " ".join(broadcast_match.group(1).split())
             hidden = "いなくても" in v or "non" in v.lower() or "true" in v.lower()
-
         return {"ssid": ssid, "password": password, "auth": auth,
                 "auto_connect": auto, "hidden": hidden}
-
-
 
 
 # ────────────────────────────────────────────────────────────
@@ -1136,11 +1132,9 @@ if __name__ == "__main__":
     import traceback
     _log = _app_dir() / "wifi_preset_error.log"
     try:
-        # ttk スタイル調整
         app = WiFiPresetApp()
         style = ttk.Style(app)
         style.theme_use("clam")
-        # Combobox 基本スタイル
         style.configure("TCombobox",
                         fieldbackground=CARD,
                         background=CARD,
@@ -1148,9 +1142,7 @@ if __name__ == "__main__":
                         selectbackground=CARD,
                         selectforeground=TEXT,
                         bordercolor=BORDER,
-                        arrowcolor=TEXT,
-                        insertcolor=TEXT)
-        # 文字色を確実に明るくするカスタムスタイル
+                        arrowcolor=TEXT)
         style.configure("Bright.TCombobox",
                         fieldbackground=CARD,
                         background=CARD,
@@ -1159,13 +1151,11 @@ if __name__ == "__main__":
                         selectforeground=TEXT,
                         bordercolor=BORDER,
                         arrowcolor=TEXT)
-        # readonly状態でも foreground が効くようにマップ設定
         style.map("Bright.TCombobox",
                   fieldbackground=[("readonly", CARD)],
                   foreground=[("readonly", TEXT)],
                   selectbackground=[("readonly", CARD)],
                   selectforeground=[("readonly", TEXT)])
-        # ドロップダウンリスト部分の文字色・背景色
         app.option_add("*TCombobox*Listbox.background", CARD)
         app.option_add("*TCombobox*Listbox.foreground", TEXT)
         app.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
@@ -1175,7 +1165,6 @@ if __name__ == "__main__":
     except Exception:
         err = traceback.format_exc()
         _log.write_text(err, encoding="utf-8")
-        # GUIでもエラー内容を表示
         try:
             import tkinter as _tk
             from tkinter import messagebox as _mb
